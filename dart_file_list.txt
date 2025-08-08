@@ -1,0 +1,16 @@
+lib/pose_processor.dart
+lib/shot_analysis.dart
+lib/utils.dart
+lib/models/pose_keypoint.dart
+lib/models/shot.dart
+lib/models/pose_data.dart
+lib/screens/camera_screen.dart
+lib/screens/result_screen.dart
+lib/screens/shot_review_screen.dart
+lib/screens/home_screen.dart
+lib/main.dart
+lib/services/camera_service.dart
+lib/services/pose_estimation_service.dart
+lib/services/shot_segmentation.dart
+lib/widgets/pose_overlay.dart
+lib/widgets/custom_button.dart

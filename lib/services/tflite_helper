@@ -1,0 +1,20 @@
+import 'package:tflite_flutter/tflite_flutter.dart';
+
+class TFLiteHelper {
+  Interpreter? _interpreter;
+
+  Future<void> loadModel() async {
+    try {
+      _interpreter = await Interpreter.fromAsset('assets/models/4.tflite');
+      print('TFLite model loaded successfully.');
+    } catch (e) {
+      print('Failed to load TFLite model: $e');
+    }
+  }
+
+  Interpreter? get interpreter => _interpreter;
+
+  void close() {
+    _interpreter?.close();
+  }
+}

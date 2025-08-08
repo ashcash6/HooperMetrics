@@ -1,0 +1,32 @@
+name: basketball_app
+description: Basketball shot analysis app.
+publish_to: 'none'
+version: 1.1.2+30
+
+environment:
+  sdk: ">=3.1.0 <4.0.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+  camera: ^0.11.1
+  tflite_flutter: ^0.11.0
+  image: ^3.0.1
+  permission_handler: ^11.3.0
+  path_provider: ^2.0.11
+  video_player: ^2.5.0
+  video_thumbnail: ^0.5.3
+  easy_video_editor: ^0.1.2
+
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+
+flutter:
+  uses-material-design: true
+  assets:
+    - assets/models/
+    - assets/logo.png
+
+
