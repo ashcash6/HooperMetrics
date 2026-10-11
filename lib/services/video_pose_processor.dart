@@ -1,160 +1,218 @@
-import 'dart:async';
 import 'dart:io';
-import 'dart:typed_data';
 import 'dart:math';
 
-import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
-import 'package:image/image.dart' as img;
-import 'package:tflite_flutter/tflite_flutter.dart';
-import 'package:video_thumbnail/video_thumbnail.dart';
+import 'package:google_mlkit_pose_detection/google_mlkit_pose_detection.dart';
+import 'package:path_provider/path_provider.dart';
 import 'package:video_player/video_player.dart';
+import 'package:video_thumbnail/video_thumbnail.dart';
 
 import '../models/pose_data.dart';
 import '../models/pose_keypoint.dart';
 
 class VideoPoseProcessor {
   final String videoPath;
-  final Interpreter interpreter;
 
-  VideoPoseProcessor({
-    required this.videoPath,
-    required this.interpreter,
-  });
+  // Match PoseData's own threshold so frames that pass isShootingArmVisible
+  // also produce non-zero angles (was 0.4, causing all angles → 0 → 0% scores).
+  static const double _minConfidence = 0.25;
+  static const double _smoothingAlpha = 0.4;
+  // 100ms = ~10fps, sufficient for shot form analysis and 2× faster than 50ms.
+  static const int _sampleIntervalMs = 100;
 
-  Future<List<PoseData>> extractPosesFromVideo() async {
+  VideoPoseProcessor({required this.videoPath});
+
+  Future<List<PoseData>> extractPosesFromVideo({
+    void Function(int current, int total)? onProgress,
+  }) async {
     final poses = <PoseData>[];
 
     final file = File(videoPath);
     if (!file.existsSync() || await file.length() == 0) {
-      debugPrint('[VideoPoseProcessor] ❌ Video file is missing or empty: $videoPath');
+      debugPrint('[VideoPoseProcessor] Video file missing or empty.');
       return poses;
     }
 
     final controller = VideoPlayerController.file(file);
     await controller.initialize();
     final durationMs = controller.value.duration.inMilliseconds;
+    // Capture video dimensions to normalize ML Kit pixel coords → [0, 1].
+    final videoSize = controller.value.size;
     await controller.dispose();
 
-    debugPrint('[VideoPoseProcessor] ✅ Video loaded: $videoPath');
-    debugPrint('[VideoPoseProcessor] 🎞 Duration: $durationMs ms');
-
-    if (durationMs == 0) {
-      debugPrint('[VideoPoseProcessor] ❌ Video has 0 duration, skipping pose extraction.');
+    if (durationMs == 0 || videoSize.isEmpty) {
+      debugPrint('[VideoPoseProcessor] Video has 0 duration or unknown size.');
       return poses;
     }
 
-    const int skipMs = 50;
-    final int frameCount = (durationMs / skipMs).floor();
+    // Use base model — it's 3–4× faster than accurate with acceptable accuracy
+    // for joint angle extraction.
+    final poseDetector = PoseDetector(
+      options: PoseDetectorOptions(
+        mode: PoseDetectionMode.single,
+        model: PoseDetectionModel.base,
+      ),
+    );
+
+    final tempDir = await getTemporaryDirectory();
+    final frameCount = (durationMs / _sampleIntervalMs).floor();
+    Map<JointName, PoseKeyPoint>? prevJoints;
+
+    debugPrint('[VideoPoseProcessor] ${durationMs}ms → $frameCount frames @ ${_sampleIntervalMs}ms');
 
     for (int i = 0; i < frameCount; i++) {
-      final int timestamp = i * skipMs;
+      onProgress?.call(i + 1, frameCount);
 
+      final timestamp = i * _sampleIntervalMs;
       if (timestamp >= durationMs - 100) break;
 
-      final Uint8List? frameData = await VideoThumbnail.thumbnailData(
-        video: videoPath,
-        imageFormat: ImageFormat.JPEG,
-        timeMs: timestamp,
-        quality: 75,
-      );
-
-      if (frameData == null) {
-        debugPrint('[VideoPoseProcessor] ❌ Failed to get frame at $timestamp ms');
+      final framePath = '${tempDir.path}/hm_frame_$i.jpg';
+      String? savedPath;
+      try {
+        savedPath = await VideoThumbnail.thumbnailFile(
+          video: videoPath,
+          thumbnailPath: framePath,
+          imageFormat: ImageFormat.JPEG,
+          timeMs: timestamp,
+          quality: 80,
+        );
+      } catch (e) {
+        debugPrint('[VideoPoseProcessor] Thumbnail error at ${timestamp}ms: $e');
         continue;
       }
 
-      final img.Image? frameImage = img.decodeImage(frameData);
-      if (frameImage == null) {
-        debugPrint('[VideoPoseProcessor] ❌ Failed to decode frame image at $timestamp ms');
-        continue;
-      }
+      if (savedPath == null) continue;
 
-      final pose = await _predictPose(frameImage, timestamp);
-      if (pose != null) {
-        poses.add(pose);
+      try {
+        final inputImage = InputImage.fromFilePath(savedPath);
+        final mlPoses = await poseDetector.processImage(inputImage);
+
+        if (mlPoses.isNotEmpty) {
+          // Normalize pixel coords → [0, 1] so the PoseOverlay widget works
+          // directly and so coords are scale-independent across devices.
+          final rawJoints = _convertMLKitPose(mlPoses.first, videoSize);
+          final smoothed = _smoothJoints(rawJoints, prevJoints);
+          prevJoints = smoothed;
+
+          final pose = _buildPoseData(smoothed, timestamp);
+          if (pose.isShootingArmVisible) {
+            poses.add(pose);
+          }
+        }
+      } catch (e) {
+        debugPrint('[VideoPoseProcessor] ML Kit error at frame $i: $e');
+      } finally {
+        try { File(savedPath).deleteSync(); } catch (_) {}
       }
     }
 
-    debugPrint('[VideoPoseProcessor] ✅ Extracted ${poses.length} valid pose frames.');
+    await poseDetector.close();
+    debugPrint('[VideoPoseProcessor] Extracted ${poses.length} valid frames.');
     return poses;
   }
 
-  Future<PoseData?> _predictPose(img.Image image, int timestampMs) async {
-    try {
-      final inputShape = interpreter.getInputTensor(0).shape;
-      final inputHeight = inputShape[1];
-      final inputWidth = inputShape[2];
+  Map<JointName, PoseKeyPoint> _convertMLKitPose(Pose pose, Size videoSize) {
+    const mapping = <PoseLandmarkType, JointName>{
+      PoseLandmarkType.nose: JointName.nose,
+      PoseLandmarkType.leftShoulder: JointName.leftShoulder,
+      PoseLandmarkType.rightShoulder: JointName.rightShoulder,
+      PoseLandmarkType.leftElbow: JointName.leftElbow,
+      PoseLandmarkType.rightElbow: JointName.rightElbow,
+      PoseLandmarkType.leftWrist: JointName.leftWrist,
+      PoseLandmarkType.rightWrist: JointName.rightWrist,
+      PoseLandmarkType.leftHip: JointName.leftHip,
+      PoseLandmarkType.rightHip: JointName.rightHip,
+      PoseLandmarkType.leftKnee: JointName.leftKnee,
+      PoseLandmarkType.rightKnee: JointName.rightKnee,
+      PoseLandmarkType.leftAnkle: JointName.leftAnkle,
+      PoseLandmarkType.rightAnkle: JointName.rightAnkle,
+    };
 
-      final resized = img.copyResize(image, width: inputWidth, height: inputHeight);
-
-      final inputBytes = Uint8List(inputHeight * inputWidth * 3);
-      int byteIndex = 0;
-
-      for (int y = 0; y < inputHeight; y++) {
-        for (int x = 0; x < inputWidth; x++) {
-          final pixel = resized.getPixel(x, y);
-          inputBytes[byteIndex++] = img.getRed(pixel);
-          inputBytes[byteIndex++] = img.getGreen(pixel);
-          inputBytes[byteIndex++] = img.getBlue(pixel);
-        }
-      }
-
-      final outputShape = interpreter.getOutputTensor(0).shape;
-      final output = List.generate(
-        outputShape[0],
-        (_) => List.generate(
-          outputShape[1],
-          (_) => List.generate(
-            outputShape[2],
-            (_) => List.filled(outputShape[3], 0.0),
-          ),
-        ),
+    final joints = <JointName, PoseKeyPoint>{};
+    for (final entry in mapping.entries) {
+      final lm = pose.landmarks[entry.key];
+      if (lm == null) continue;
+      joints[entry.value] = PoseKeyPoint(
+        name: entry.value,
+        // Normalize to [0, 1] — required by PoseOverlay painter.
+        x: (lm.x / videoSize.width).clamp(0.0, 1.0),
+        y: (lm.y / videoSize.height).clamp(0.0, 1.0),
+        confidence: lm.likelihood,
       );
-
-      interpreter.run(inputBytes.buffer.asUint8List(), output);
-
-      final joints = <JointName, PoseKeyPoint>{
-        for (int i = 0; i < 17; i++)
-          JointName.values[i]: PoseKeyPoint(
-            name: JointName.values[i],
-            x: output[0][0][i][0],
-            y: output[0][0][i][1],
-            z: output[0][0][i][2],
-          ),
-      };
-
-      return PoseData(
-        joints: joints,
-        leftElbowAngle: _calculateAngle(
-          joints[JointName.leftShoulder]!,
-          joints[JointName.leftElbow]!,
-          joints[JointName.leftWrist]!,
-        ),
-        rightElbowAngle: _calculateAngle(
-          joints[JointName.rightShoulder]!,
-          joints[JointName.rightElbow]!,
-          joints[JointName.rightWrist]!,
-        ),
-        leftKneeAngle: _calculateAngle(
-          joints[JointName.leftHip]!,
-          joints[JointName.leftKnee]!,
-          joints[JointName.leftAnkle]!,
-        ),
-        rightKneeAngle: _calculateAngle(
-          joints[JointName.rightHip]!,
-          joints[JointName.rightKnee]!,
-          joints[JointName.rightAnkle]!,
-        ),
-        timestampMs: timestampMs,
-      );
-    } catch (e) {
-      debugPrint('[VideoPoseProcessor] ⚠️ Pose prediction error: $e');
-      return null;
     }
+    return joints;
   }
 
-  double _calculateAngle(PoseKeyPoint a, PoseKeyPoint b, PoseKeyPoint c) {
+  Map<JointName, PoseKeyPoint> _smoothJoints(
+    Map<JointName, PoseKeyPoint> current,
+    Map<JointName, PoseKeyPoint>? previous,
+  ) {
+    if (previous == null) return current;
+
+    final result = <JointName, PoseKeyPoint>{};
+    for (final entry in current.entries) {
+      final cur = entry.value;
+      final prev = previous[entry.key];
+      if (prev == null) {
+        result[entry.key] = cur;
+        continue;
+      }
+      // Carry forward when confidence is low (e.g. ball occlusion).
+      final alpha = cur.confidence > _minConfidence ? _smoothingAlpha : 0.1;
+      result[entry.key] = PoseKeyPoint(
+        name: cur.name,
+        x: alpha * cur.x + (1 - alpha) * prev.x,
+        y: alpha * cur.y + (1 - alpha) * prev.y,
+        confidence: alpha * cur.confidence + (1 - alpha) * prev.confidence,
+      );
+    }
+    return result;
+  }
+
+  PoseData _buildPoseData(Map<JointName, PoseKeyPoint> joints, int timestampMs) {
+    return PoseData(
+      joints: joints,
+      leftElbowAngle: _angle(
+        joints[JointName.leftShoulder],
+        joints[JointName.leftElbow],
+        joints[JointName.leftWrist],
+      ),
+      rightElbowAngle: _angle(
+        joints[JointName.rightShoulder],
+        joints[JointName.rightElbow],
+        joints[JointName.rightWrist],
+      ),
+      leftKneeAngle: _angle(
+        joints[JointName.leftHip],
+        joints[JointName.leftKnee],
+        joints[JointName.leftAnkle],
+      ),
+      rightKneeAngle: _angle(
+        joints[JointName.rightHip],
+        joints[JointName.rightKnee],
+        joints[JointName.rightAnkle],
+      ),
+      leftShoulderAngle: _angle(
+        joints[JointName.leftElbow],
+        joints[JointName.leftShoulder],
+        joints[JointName.leftHip],
+      ),
+      rightShoulderAngle: _angle(
+        joints[JointName.rightElbow],
+        joints[JointName.rightShoulder],
+        joints[JointName.rightHip],
+      ),
+      timestampMs: timestampMs,
+    );
+  }
+
+  double _angle(PoseKeyPoint? a, PoseKeyPoint? b, PoseKeyPoint? c) {
+    if (a == null || b == null || c == null) return 0.0;
+    if (a.confidence < _minConfidence ||
+        b.confidence < _minConfidence ||
+        c.confidence < _minConfidence) {
+      return 0.0;
+    }
     final ab = Offset(a.x - b.x, a.y - b.y);
     final cb = Offset(c.x - b.x, c.y - b.y);
     final dot = ab.dx * cb.dx + ab.dy * cb.dy;

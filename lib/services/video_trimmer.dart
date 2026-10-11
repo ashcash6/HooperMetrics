@@ -1,4 +1,5 @@
 import 'dart:io';
+import 'package:flutter/foundation.dart';
 import 'package:path_provider/path_provider.dart';
 import '../models/pose_data.dart';
 import 'package:easy_video_editor/easy_video_editor.dart';
@@ -32,7 +33,7 @@ class VideoTrimmer {
           shotPaths.add(exportedPath);
         }
       } catch (e) {
-        print('[VideoTrimmer] Failed to trim shot $i: $e');
+        debugPrint('[VideoTrimmer] Failed to trim shot $i: $e');
       }
     }
 

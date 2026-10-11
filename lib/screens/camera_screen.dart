@@ -1,22 +1,19 @@
 import 'dart:async';
 import 'dart:io';
 import 'package:flutter/material.dart';
-import 'package:tflite_flutter/tflite_flutter.dart';
 
+import '../models/pose_data.dart';
 import '../services/video_trimmer.dart';
 import '../services/ios_camera_permission.dart';
 import '../services/camera_service.dart';
-import '../services/pose_estimation_service.dart';
 import '../services/shot_segmentation.dart';
 import '../services/shot_analysis.dart';
 import '../services/video_pose_processor.dart';
-import '../models/pose_data.dart';
 import 'result_screen.dart';
 
 class CameraScreen extends StatefulWidget {
   static const String routeName = '/camera';
-
-  const CameraScreen({Key? key}) : super(key: key);
+  const CameraScreen({super.key});
 
   @override
   State<CameraScreen> createState() => _CameraScreenState();
@@ -29,6 +26,10 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
   String? _initError;
   bool _isProcessing = false;
   bool _canStop = false;
+  bool _isInitializing = false;
+  bool _isStartingRecording = false;
+  int _progressCurrent = 0;
+  int _progressTotal = 0;
 
   late Future<void> _initializationFuture;
 
@@ -48,72 +49,73 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) async {
+    // Only check permission status on resume — never re-init the camera here.
+    // Re-initializing on resume triggers a race: the permission dialog closing
+    // fires "resumed", which would dispose a controller that might be mid-init.
+    // The camera plugin handles pause/resume internally.
     if (state == AppLifecycleState.resumed) {
       final granted = await IOSCameraPermission.isCameraPermissionGranted();
       if (!mounted) return;
-      if (granted) {
-        setState(() {
-          _permissionDenied = false;
-          _initError = null;
-          _initializationFuture = _initializeCamera();
-        });
-      } else {
-        setState(() => _permissionDenied = true);
-      }
+      if (!granted) setState(() => _permissionDenied = true);
     }
   }
 
   Future<void> _initializeCamera() async {
+    if (_isInitializing) return;
+    _isInitializing = true;
     try {
       final granted = await IOSCameraPermission.isCameraPermissionGranted();
+      if (!mounted) return;
       if (!granted) {
         final requested = await IOSCameraPermission.requestCameraPermission();
+        if (!mounted) return;
         if (!requested) {
           setState(() => _permissionDenied = true);
-          throw Exception('Camera permission denied');
+          return;
         }
       }
-
       await _cameraService.initialize();
+      if (!mounted) return;
       if (!_cameraService.isInitialized) {
-        throw Exception('Camera failed to initialize');
+        setState(() => _initError = 'Camera failed to initialize');
       }
     } catch (e) {
-      setState(() => _initError = e.toString());
-      rethrow;
+      if (mounted) setState(() => _initError = e.toString());
+    } finally {
+      _isInitializing = false;
     }
   }
 
   Future<void> _startRecording() async {
+    if (_isStartingRecording) return;
+    _isStartingRecording = true;
     setState(() => _canStop = false);
 
+    bool started = false;
     try {
       await _cameraService.startRecording();
+      started = true;
     } catch (e) {
+      debugPrint('[CameraScreen] startRecording error: $e');
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Failed to start recording: $e')),
-        );
+        // CameraService already attempted recovery internally; if we're here
+        // both attempts failed. Refresh the preview widget and tell the user.
+        setState(() {});
+        _showSnack('Camera not ready — please try again.');
       }
-      return;
+    } finally {
+      _isStartingRecording = false;
     }
 
-    if (!mounted) return;
-
-    setState(() {
-      _isRecording = true;
-    });
-
+    if (!started || !mounted) return;
+    setState(() => _isRecording = true);
     Future.delayed(const Duration(seconds: 1), () {
-      if (mounted) {
-        setState(() => _canStop = true);
-      }
+      if (mounted) setState(() => _canStop = true);
     });
   }
 
   Future<void> _stopRecording() async {
     if (!_canStop) return;
-
     setState(() {
       _isRecording = false;
       _isProcessing = true;
@@ -122,22 +124,21 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
     try {
       await _cameraService.stopRecording();
     } catch (e) {
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Failed to stop recording: $e')),
-        );
-      }
-      setState(() {
-        _isProcessing = false;
-        _canStop = false;
-      });
+      if (mounted) _showSnack('Failed to stop recording: $e');
+      setState(() { _isProcessing = false; _canStop = false; });
       return;
     }
 
-    await Future.delayed(const Duration(seconds: 3));
-
     final videoPath = _cameraService.recordedVideoPath;
-    print('[CameraScreen] Video path: $videoPath');
+
+    if (videoPath != null) {
+      final deadline = DateTime.now().add(const Duration(seconds: 10));
+      while (DateTime.now().isBefore(deadline)) {
+        final f = File(videoPath);
+        if (await f.exists() && await f.length() > 0) break;
+        await Future.delayed(const Duration(milliseconds: 200));
+      }
+    }
 
     if (videoPath == null || !await File(videoPath).exists()) {
       setState(() => _isProcessing = false);
@@ -145,15 +146,26 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
     }
 
     try {
-      final interpreter = await Interpreter.fromAsset('assets/models/4.tflite');
-      final processor = VideoPoseProcessor(videoPath: videoPath, interpreter: interpreter);
-      final poses = await processor.extractPosesFromVideo();
+      final processor = VideoPoseProcessor(videoPath: videoPath);
+      final poses = await processor.extractPosesFromVideo(
+        onProgress: (current, total) {
+          // Update UI every 5 frames — calling setState per-frame causes
+          // hundreds of full widget-tree rebuilds during processing.
+          if (mounted && (current == 1 || current % 5 == 0 || current == total)) {
+            setState(() { _progressCurrent = current; _progressTotal = total; });
+          }
+        },
+      );
 
-      final shots = ShotSegmentation.detectShots(poses);
+      final allShots = ShotSegmentation.detectShots(poses);
+
+      // The first detected shot is always treated as a calibration and dropped.
+      // Users are told to take one warm-up shot before their real session.
+      final shots = allShots.length > 1 ? allShots.sublist(1) : <List<PoseData>>[];
 
       if (shots.isEmpty) {
         setState(() => _isProcessing = false);
-        _showNoShotsDetectedDialog();
+        _showNoShotsDialog(calibrationOnly: allShots.isNotEmpty);
         return;
       }
 
@@ -177,70 +189,112 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
         ),
       );
     } catch (e, stack) {
-      print('[CameraScreen] ❌ Error during video processing: $e');
-      print(stack);
+      debugPrint('[CameraScreen] Error: $e\n$stack');
       if (mounted) {
         setState(() => _isProcessing = false);
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text('Video analysis failed: $e'),
-            backgroundColor: Colors.redAccent,
-          ),
-        );
+        _showSnack('Analysis failed: $e');
       }
     }
   }
 
-  void _showNoShotsDetectedDialog() {
+  void _showSnack(String msg) {
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(content: Text(msg), backgroundColor: const Color(0xFF1A1A1A)),
+    );
+  }
+
+  void _showNoShotsDialog({bool calibrationOnly = false}) {
     showDialog(
       context: context,
       barrierDismissible: false,
       builder: (context) => AlertDialog(
-        backgroundColor: Colors.black87,
-        title: const Text(
-          'No Shots Detected',
-          style: TextStyle(color: Colors.orangeAccent),
+        backgroundColor: const Color(0xFF1A1A1A),
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+        title: Text(
+          calibrationOnly ? 'Only Calibration Shot Found' : 'No Shots Detected',
+          style: const TextStyle(color: Colors.white, fontWeight: FontWeight.w700),
         ),
-        content: const Text(
-          'We could not detect any shots in your video.\n\n'
-          'Please review the shooting instructions and try again.',
-          style: TextStyle(color: Colors.white70),
+        content: Text(
+          calibrationOnly
+              ? 'Only your calibration shot was detected. After the calibration, take at least one more shot — hold your follow-through until the ball is in the air.'
+              : 'We could not detect any shots in your video.\n\n'
+                'Make sure you are standing sideways with your full body in frame, and hold your follow-through after each shot.',
+          style: const TextStyle(color: Color(0xFF888888), height: 1.5),
         ),
         actions: [
           TextButton(
             onPressed: () => Navigator.of(context).pop(),
-            child: const Text('OK', style: TextStyle(color: Colors.orangeAccent)),
+            child: const Text('OK', style: TextStyle(color: Color(0xFFFF6B00), fontWeight: FontWeight.w600)),
           ),
         ],
       ),
     );
   }
 
+  // ── Error / permission screens ───────────────────────────────────────────────
+
   Widget _buildPermissionDeniedScreen() {
+    return _buildStatusScreen(
+      icon: Icons.videocam_off_outlined,
+      title: 'Camera Access Required',
+      subtitle: 'Please grant camera permission to use HooperMetrics.',
+      action: ElevatedButton(
+        onPressed: IOSCameraPermission.openSettings,
+        style: _orangeButtonStyle,
+        child: const Text('Open Settings'),
+      ),
+    );
+  }
+
+  Widget _buildErrorScreen(String error) {
+    return _buildStatusScreen(
+      icon: Icons.error_outline_rounded,
+      title: 'Something went wrong',
+      subtitle: error,
+      action: ElevatedButton(
+        onPressed: () => setState(() {
+          _initError = null;
+          _initializationFuture = _initializeCamera();
+        }),
+        style: _orangeButtonStyle,
+        child: const Text('Retry'),
+      ),
+    );
+  }
+
+  Widget _buildStatusScreen({
+    required IconData icon,
+    required String title,
+    required String subtitle,
+    required Widget action,
+  }) {
     return Scaffold(
-      backgroundColor: Colors.black,
+      backgroundColor: const Color(0xFF0F0F0F),
       body: Center(
         child: Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 32),
+          padding: const EdgeInsets.symmetric(horizontal: 36),
           child: Column(
             mainAxisAlignment: MainAxisAlignment.center,
             children: [
-              const Icon(Icons.videocam_off, size: 64, color: Colors.orangeAccent),
-              const SizedBox(height: 24),
-              const Text(
-                'Camera permission is required to use this feature.',
-                textAlign: TextAlign.center,
-                style: TextStyle(color: Colors.white, fontSize: 18),
-              ),
-              const SizedBox(height: 24),
-              ElevatedButton(
-                onPressed: IOSCameraPermission.openSettings,
-                style: ElevatedButton.styleFrom(
-                  backgroundColor: Colors.orange,
-                  padding: const EdgeInsets.symmetric(horizontal: 32, vertical: 16),
+              Container(
+                width: 72,
+                height: 72,
+                decoration: BoxDecoration(
+                  color: const Color(0xFF1A1A1A),
+                  borderRadius: BorderRadius.circular(20),
                 ),
-                child: const Text('Open Settings', style: TextStyle(fontSize: 16)),
+                child: Icon(icon, size: 36, color: const Color(0xFFFF6B00)),
               ),
+              const SizedBox(height: 24),
+              Text(title,
+                  textAlign: TextAlign.center,
+                  style: const TextStyle(color: Colors.white, fontSize: 18, fontWeight: FontWeight.w700)),
+              const SizedBox(height: 10),
+              Text(subtitle,
+                  textAlign: TextAlign.center,
+                  style: const TextStyle(color: Color(0xFF888888), fontSize: 14, height: 1.5)),
+              const SizedBox(height: 32),
+              action,
             ],
           ),
         ),
@@ -248,176 +302,205 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
     );
   }
 
-  Widget _buildErrorScreen(String error) {
-    return Scaffold(
-      backgroundColor: Colors.black,
-      body: Center(
-        child: Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 32),
-          child: Column(
-            mainAxisAlignment: MainAxisAlignment.center,
-            children: [
-              const Icon(Icons.error_outline, size: 64, color: Colors.redAccent),
-              const SizedBox(height: 24),
-              Text(
-                'Error: $error',
-                textAlign: TextAlign.center,
-                style: const TextStyle(color: Colors.white, fontSize: 18),
-              ),
-              const SizedBox(height: 24),
-              ElevatedButton(
-                onPressed: () {
-                  setState(() {
-                    _initError = null;
-                    _initializationFuture = _initializeCamera();
-                  });
-                },
-                style: ElevatedButton.styleFrom(
-                  backgroundColor: Colors.orange,
-                  padding: const EdgeInsets.symmetric(horizontal: 32, vertical: 16),
-                ),
-                child: const Text('Retry', style: TextStyle(fontSize: 16)),
-              ),
-            ],
-          ),
-        ),
-      ),
-    );
-  }
+  // ── Main build ───────────────────────────────────────────────────────────────
 
   @override
   Widget build(BuildContext context) {
     if (_permissionDenied) return _buildPermissionDeniedScreen();
     if (_initError != null) return _buildErrorScreen(_initError!);
 
-    return Stack(
-      children: [
-        FutureBuilder<void>(
-          future: _initializationFuture,
-          builder: (context, snapshot) {
-            if (snapshot.connectionState == ConnectionState.waiting) {
-              return const Scaffold(
-                backgroundColor: Colors.black,
-                body: Center(child: CircularProgressIndicator()),
-              );
-            } else if (snapshot.hasError) {
-              return _buildErrorScreen(snapshot.error.toString());
-            } else {
-              return Scaffold(
-                backgroundColor: Colors.black,
-                body: SizedBox.expand(
-                  child: Column(
-                    children: [
-                      Expanded(
-                        flex: 7,
-                        child: SizedBox.expand(
-                          child: _cameraService.buildPreview(),
-                        ),
-                      ),
-                      Expanded(
-                        flex: 3,
-                        child: Container(
-                          padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 20),
-                          child: Column(
-                            mainAxisAlignment: MainAxisAlignment.spaceEvenly,
-                            crossAxisAlignment: CrossAxisAlignment.center,
-                            children: [
-                              ElevatedButton(
-                                onPressed: _isRecording
-                                    ? (_canStop ? _stopRecording : null)
-                                    : _startRecording,
-                                style: ElevatedButton.styleFrom(
-                                  backgroundColor: _isRecording ? Colors.redAccent : Colors.orange,
-                                  padding: const EdgeInsets.symmetric(horizontal: 48, vertical: 18),
-                                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(30)),
-                                ),
-                                child: Text(
-                                  _isRecording ? 'Stop Recording' : 'Start Recording',
-                                  style: const TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
-                                ),
-                              ),
-                              OutlinedButton(
-                                onPressed: _showInstructionsModal,
-                                style: OutlinedButton.styleFrom(
-                                  side: const BorderSide(color: Colors.orangeAccent, width: 2),
-                                  padding: const EdgeInsets.symmetric(horizontal: 36, vertical: 16),
-                                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(30)),
-                                ),
-                                child: const Text(
-                                  'View Shooting Instructions',
-                                  style: TextStyle(fontSize: 16, color: Colors.orangeAccent),
-                                ),
-                              ),
-                            ],
-                          ),
-                        ),
-                      ),
-                    ],
-                  ),
-                ),
-              );
-            }
-          },
-        ),
-        if (_isProcessing)
-          Container(
-            color: Colors.black.withOpacity(0.85),
-            child: const Center(
-              child: Column(
-                mainAxisSize: MainAxisSize.min,
+    return Scaffold(
+      backgroundColor: Colors.black,
+      body: Stack(
+        fit: StackFit.expand,
+        children: [
+          // Full-screen camera preview
+          FutureBuilder<void>(
+            future: _initializationFuture,
+            builder: (context, snapshot) {
+              if (snapshot.connectionState == ConnectionState.waiting) {
+                return const Center(
+                  child: CircularProgressIndicator(color: Color(0xFFFF6B00), strokeWidth: 2),
+                );
+              } else if (snapshot.hasError) {
+                return _buildErrorScreen(snapshot.error.toString());
+              }
+              return SizedBox.expand(child: _cameraService.buildPreview());
+            },
+          ),
+
+          // Top bar
+          SafeArea(
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+              child: Row(
+                mainAxisAlignment: MainAxisAlignment.spaceBetween,
                 children: [
-                  CircularProgressIndicator(color: Colors.orange),
-                  SizedBox(height: 20),
-                  Text(
-                    'Processing video...',
-                    style: TextStyle(color: Colors.orangeAccent, fontSize: 18),
+                  _CircleIconButton(
+                    icon: Icons.arrow_back_ios_new_rounded,
+                    onTap: () => Navigator.of(context).pop(),
                   ),
+                  if (_isRecording)
+                    _RecBadge()
+                  else
+                    _CircleIconButton(
+                      icon: Icons.help_outline_rounded,
+                      onTap: _showInstructionsModal,
+                    ),
                 ],
               ),
             ),
           ),
-      ],
+
+          // Bottom gradient + record button
+          Positioned(
+            bottom: 0,
+            left: 0,
+            right: 0,
+            child: Container(
+              padding: const EdgeInsets.fromLTRB(0, 48, 0, 56),
+              decoration: BoxDecoration(
+                gradient: LinearGradient(
+                  begin: Alignment.bottomCenter,
+                  end: Alignment.topCenter,
+                  colors: [Colors.black.withValues(alpha: 0.85), Colors.transparent],
+                ),
+              ),
+              child: Center(child: _buildRecordButton()),
+            ),
+          ),
+
+          // Processing overlay
+          if (_isProcessing) _buildProcessingOverlay(),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildRecordButton() {
+    final isWaiting = _isRecording && !_canStop;
+
+    return GestureDetector(
+      onTap: isWaiting ? null : (_isRecording ? _stopRecording : _startRecording),
+      child: AnimatedContainer(
+        duration: const Duration(milliseconds: 250),
+        curve: Curves.easeOut,
+        width: _isRecording ? 68 : 78,
+        height: _isRecording ? 68 : 78,
+        decoration: BoxDecoration(
+          color: isWaiting
+              ? const Color(0xFF333333)
+              : (_isRecording ? Colors.redAccent : const Color(0xFFFF6B00)),
+          shape: BoxShape.circle,
+          border: Border.all(color: Colors.white.withValues(alpha: 0.9), width: 3),
+        ),
+        child: Icon(
+          _isRecording ? Icons.stop_rounded : Icons.fiber_manual_record_rounded,
+          color: Colors.white,
+          size: _isRecording ? 30 : 34,
+        ),
+      ),
+    );
+  }
+
+  Widget _buildProcessingOverlay() {
+    return Container(
+      color: Colors.black.withValues(alpha: 0.88),
+      child: Center(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const SizedBox(
+              width: 48,
+              height: 48,
+              child: CircularProgressIndicator(
+                color: Color(0xFFFF6B00),
+                strokeWidth: 3,
+              ),
+            ),
+            const SizedBox(height: 20),
+            const Text(
+              'Analyzing your shots…',
+              style: TextStyle(color: Colors.white, fontSize: 17, fontWeight: FontWeight.w600),
+            ),
+            if (_progressTotal > 0) ...[
+              const SizedBox(height: 16),
+              SizedBox(
+                width: 220,
+                child: Column(
+                  children: [
+                    ClipRRect(
+                      borderRadius: BorderRadius.circular(4),
+                      child: LinearProgressIndicator(
+                        value: _progressCurrent / _progressTotal,
+                        backgroundColor: const Color(0xFF2A2A2A),
+                        valueColor: const AlwaysStoppedAnimation<Color>(Color(0xFFFF6B00)),
+                        minHeight: 4,
+                      ),
+                    ),
+                    const SizedBox(height: 8),
+                    Text(
+                      'Frame $_progressCurrent of $_progressTotal',
+                      style: const TextStyle(color: Color(0xFF666666), fontSize: 13),
+                    ),
+                  ],
+                ),
+              ),
+            ],
+          ],
+        ),
+      ),
     );
   }
 
   void _showInstructionsModal() {
-    showDialog(
+    showModalBottomSheet(
       context: context,
-      barrierDismissible: true,
-      builder: (_) => Dialog(
-        backgroundColor: Colors.black.withOpacity(0.95),
-        insetPadding: EdgeInsets.zero,
-        child: Stack(
+      backgroundColor: const Color(0xFF141414),
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+      ),
+      builder: (_) => Padding(
+        padding: const EdgeInsets.fromLTRB(24, 20, 24, 40),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            Padding(
-              padding: const EdgeInsets.fromLTRB(20, 40, 20, 20),
-              child: ListView(
-                children: [
-                  const Text(
-                    'Shooting Setup Guide',
-                    style: TextStyle(color: Colors.orangeAccent, fontSize: 22, fontWeight: FontWeight.bold),
-                  ),
-                  const SizedBox(height: 12),
-                  ...[
-                    'The first shot is used for calibration',
-                    'Always try to shoot from the same spot each time',
-                    'Stand sideways to the camera when shooting',
-                    'Stand around 10 feet from the camera',
-                    'Keep the phone vertical',
-                    'Use a tripod or keep the phone still',
-                    'Make sure your whole body is visible and close to the camera',
-                    'Hold your follow-through',
-                    'Avoid walking or celebrating between shots',
-                  ].map(_buildTip),
-                ],
+            Center(
+              child: Container(
+                width: 36,
+                height: 4,
+                decoration: BoxDecoration(
+                  color: const Color(0xFF444444),
+                  borderRadius: BorderRadius.circular(2),
+                ),
               ),
             ),
-            Positioned(
-              top: 12,
-              right: 12,
-              child: IconButton(
-                icon: const Icon(Icons.close, color: Colors.white, size: 28),
-                onPressed: () => Navigator.of(context).pop(),
+            const SizedBox(height: 20),
+            const Text(
+              'Quick Setup Reminders',
+              style: TextStyle(color: Colors.white, fontSize: 17, fontWeight: FontWeight.w700),
+            ),
+            const SizedBox(height: 16),
+            ...[
+              'Phone on tripod or stable surface, ~10 ft away',
+              'Stand sideways — shooting side facing camera',
+              'Full body visible from head to toe',
+              'First shot is a calibration — it won\'t be scored',
+              'Hold your follow-through after each shot',
+              'Stay in the same spot between shots',
+            ].map(
+              (t) => Padding(
+                padding: const EdgeInsets.only(bottom: 12),
+                child: Row(
+                  children: [
+                    const Icon(Icons.check_circle_outline, color: Color(0xFFFF6B00), size: 18),
+                    const SizedBox(width: 10),
+                    Expanded(
+                      child: Text(t, style: const TextStyle(color: Color(0xFFCCCCCC), fontSize: 14)),
+                    ),
+                  ],
+                ),
               ),
             ),
           ],
@@ -425,22 +508,93 @@ class _CameraScreenState extends State<CameraScreen> with WidgetsBindingObserver
       ),
     );
   }
+}
 
-  Widget _buildTip(String text) {
-    return Padding(
-      padding: const EdgeInsets.symmetric(vertical: 6),
-      child: Row(
-        crossAxisAlignment: CrossAxisAlignment.start,
+// ── Shared small widgets ─────────────────────────────────────────────────────
+
+class _CircleIconButton extends StatelessWidget {
+  final IconData icon;
+  final VoidCallback onTap;
+
+  const _CircleIconButton({required this.icon, required this.onTap});
+
+  @override
+  Widget build(BuildContext context) {
+    return GestureDetector(
+      onTap: onTap,
+      child: Container(
+        width: 40,
+        height: 40,
+        decoration: BoxDecoration(
+          color: Colors.black.withValues(alpha: 0.55),
+          shape: BoxShape.circle,
+          border: Border.all(color: Colors.white.withValues(alpha: 0.15)),
+        ),
+        child: Icon(icon, color: Colors.white, size: 18),
+      ),
+    );
+  }
+}
+
+class _RecBadge extends StatelessWidget {
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+      decoration: BoxDecoration(
+        color: Colors.redAccent,
+        borderRadius: BorderRadius.circular(20),
+      ),
+      child: const Row(
+        mainAxisSize: MainAxisSize.min,
         children: [
-          const Text('• ', style: TextStyle(color: Colors.orangeAccent, fontSize: 16)),
-          Expanded(
-            child: Text(
-              text,
-              style: const TextStyle(color: Colors.white70, fontSize: 16),
-            ),
-          ),
+          _PulseDot(),
+          SizedBox(width: 6),
+          Text('REC',
+              style: TextStyle(
+                  color: Colors.white, fontWeight: FontWeight.w700, fontSize: 11, letterSpacing: 1)),
         ],
       ),
     );
   }
 }
+
+class _PulseDot extends StatefulWidget {
+  const _PulseDot();
+
+  @override
+  State<_PulseDot> createState() => _PulseDotState();
+}
+
+class _PulseDotState extends State<_PulseDot> with SingleTickerProviderStateMixin {
+  late final AnimationController _ctrl =
+      AnimationController(vsync: this, duration: const Duration(milliseconds: 700))
+        ..repeat(reverse: true);
+  late final Animation<double> _anim = Tween(begin: 0.4, end: 1.0).animate(_ctrl);
+
+  @override
+  void dispose() {
+    _ctrl.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return FadeTransition(
+      opacity: _anim,
+      child: Container(
+        width: 7,
+        height: 7,
+        decoration: const BoxDecoration(color: Colors.white, shape: BoxShape.circle),
+      ),
+    );
+  }
+}
+
+final _orangeButtonStyle = ElevatedButton.styleFrom(
+  backgroundColor: const Color(0xFFFF6B00),
+  foregroundColor: Colors.white,
+  padding: const EdgeInsets.symmetric(horizontal: 32, vertical: 16),
+  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+  elevation: 0,
+);

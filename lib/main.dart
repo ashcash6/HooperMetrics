@@ -1,42 +1,39 @@
 import 'package:flutter/material.dart';
-import 'package:tflite_flutter/tflite_flutter.dart';
 
 import 'screens/home_screen.dart';
 import 'screens/camera_screen.dart';
-// import 'screens/result_screen.dart';  // You can still import it for type safety, no problem
+import 'screens/setup_guide_screen.dart';
+import 'screens/history_screen.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
-
-  // Test loading the TFLite model asset
-  try {
-    final interpreter = await Interpreter.fromAsset('assets/models/4.tflite');
-    print('TFLite model loaded successfully.');
-    interpreter.close();
-  } catch (e) {
-    print('Failed to load TFLite model: $e');
-  }
-
-  runApp(const MyApp());
+  runApp(const HooperMetricsApp());
 }
 
-class MyApp extends StatelessWidget {
-  const MyApp({super.key});
+class HooperMetricsApp extends StatelessWidget {
+  const HooperMetricsApp({super.key});
 
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'Basketball Shot Analyzer',
-      theme: ThemeData(
-        colorScheme: ColorScheme.fromSeed(seedColor: Colors.orange),
-        useMaterial3: true,
+      title: 'HooperMetrics',
+      debugShowCheckedModeBanner: false,
+      color: const Color(0xFF0F0F0F),
+      theme: ThemeData.dark(useMaterial3: true).copyWith(
+        scaffoldBackgroundColor: const Color(0xFF0F0F0F),
+        colorScheme: const ColorScheme.dark(
+          primary: Color(0xFFFF6B00),
+          secondary: Color(0xFFFF6B00),
+          surface: Color(0xFF1A1A1A),
+        ),
       ),
-      initialRoute: '/',
       routes: {
-        '/': (context) => const HomeScreen(),
-        CameraScreen.routeName: (context) => const CameraScreen(),
-        // Removed ResultScreen route here because it requires parameters
+        HomeScreen.routeName: (_) => const HomeScreen(),
+        SetupGuideScreen.routeName: (_) => const SetupGuideScreen(),
+        CameraScreen.routeName: (_) => const CameraScreen(),
+        HistoryScreen.routeName: (_) => const HistoryScreen(),
       },
+      initialRoute: HomeScreen.routeName,
     );
   }
 }

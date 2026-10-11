@@ -1,7 +1,7 @@
-name: basketball_app
-description: Basketball shot analysis app.
+name: hooper_metrics
+description: HooperMetrics — basketball shot analysis app.
 publish_to: 'none'
-version: 1.1.2+30
+version: 3.0.0+3
 
 environment:
   sdk: ">=3.1.0 <4.0.0"
@@ -10,23 +10,25 @@ dependencies:
   flutter:
     sdk: flutter
   camera: ^0.11.1
-  tflite_flutter: ^0.11.0
-  image: ^3.0.1
+  google_mlkit_pose_detection: ^0.12.0
+  sqflite: ^2.3.0
+  path: ^1.9.0
   permission_handler: ^11.3.0
   path_provider: ^2.0.11
   video_player: ^2.5.0
   video_thumbnail: ^0.5.3
   easy_video_editor: ^0.1.2
+  vector_math: ^2.1.0
 
 
 dev_dependencies:
   flutter_test:
     sdk: flutter
+  flutter_lints: ^3.0.0
 
 flutter:
   uses-material-design: true
   assets:
-    - assets/models/
     - assets/logo.png
 
 

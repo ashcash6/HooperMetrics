@@ -1,5 +1,3 @@
-// lib/models/pose_keypoint.dart
-
 enum JointName {
   nose,
   leftEye,
@@ -24,13 +22,13 @@ class PoseKeyPoint {
   final JointName name;
   final double x;
   final double y;
-  final double z;
+  final double confidence;
 
-  PoseKeyPoint({
+  const PoseKeyPoint({
     required this.name,
     required this.x,
     required this.y,
-    required this.z,
+    required this.confidence,
   });
 
   PoseKeyPoint operator -(PoseKeyPoint other) {
@@ -38,7 +36,7 @@ class PoseKeyPoint {
       name: name,
       x: x - other.x,
       y: y - other.y,
-      z: z - other.z,
+      confidence: (confidence + other.confidence) / 2,
     );
   }
 }

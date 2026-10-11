@@ -1,6 +1,5 @@
 // lib/models/shot.dart
 
-import 'pose_keypoint.dart';
 import 'pose_data.dart';
 class Shot {
   final int startFrame;

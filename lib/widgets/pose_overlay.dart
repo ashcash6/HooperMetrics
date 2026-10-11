@@ -1,36 +1,30 @@
 import 'package:flutter/material.dart';
+
 import '../models/pose_keypoint.dart';
 import '../models/pose_data.dart';
 
 class PoseOverlay extends StatelessWidget {
-   final PoseData? poseData;
-   final double width;
-   final double height;
+  final PoseData? poseData;
+  final double width;
+  final double height;
 
-   const PoseOverlay({
-     Key? key,
-     required this.poseData,
-     required this.width,
-     required this.height,
-   }) : super(key: key);
+  const PoseOverlay({
+    super.key,
+    required this.poseData,
+    required this.width,
+    required this.height,
+  });
 
-   @override
-   Widget build(BuildContext context) {
-     if (poseData == null) return const SizedBox.shrink();
+  @override
+  Widget build(BuildContext context) {
+    if (poseData == null) return const SizedBox.shrink();
 
-     return Transform(
-       alignment: Alignment.center,
-       transform: Matrix4.identity()
-         ..rotateZ(-pi / 2)      // Rotate 90° CCW to match portrait
-         ..scale(-1.0, 1.0),     // Flip horizontally
-       child: CustomPaint(
-         size: Size(height, width), // Swap width/height because of rotation
-         painter: _PosePainter(poseData!, height, width),
-       ),
-     );
-   }
- }
-
+    return CustomPaint(
+      size: Size(width, height),
+      painter: _PosePainter(poseData!, width, height),
+    );
+  }
+}
 
 class _PosePainter extends CustomPainter {
   final PoseData poseData;
@@ -39,29 +33,39 @@ class _PosePainter extends CustomPainter {
 
   _PosePainter(this.poseData, this.width, this.height);
 
+  Color _confidenceColor(double confidence) {
+    if (confidence >= 0.65) return Colors.greenAccent;
+    if (confidence >= 0.35) return Colors.orangeAccent;
+    return Colors.redAccent;
+  }
+
   @override
   void paint(Canvas canvas, Size size) {
-    final paint = Paint()
-      ..color = Colors.orangeAccent
-      ..strokeWidth = 3;
-
     final joints = poseData.joints;
 
-    Offset? joint(JointName name) {
-      if (!joints.containsKey(name)) return null;
-      final kp = joints[name]!;
-      return Offset(kp.x * width, kp.y * height);
+    Offset? jointOffset(JointName name) {
+      final kp = joints[name];
+      if (kp == null) return null;
+      // Coordinates are [0,1] normalized; scale to canvas dimensions.
+      return Offset(kp.x * size.width, kp.y * size.height);
     }
 
-    void drawLine(JointName a, JointName b) {
-      final p1 = joint(a);
-      final p2 = joint(b);
-      if (p1 != null && p2 != null) {
-        canvas.drawLine(p1, p2, paint);
-      }
+    void drawBone(JointName a, JointName b) {
+      final p1 = jointOffset(a);
+      final p2 = jointOffset(b);
+      if (p1 == null || p2 == null) return;
+
+      final confA = joints[a]!.confidence;
+      final confB = joints[b]!.confidence;
+      final minConf = confA < confB ? confA : confB;
+
+      final paint = Paint()
+        ..color = _confidenceColor(minConf).withValues(alpha: 0.75)
+        ..strokeWidth = 2.5;
+      canvas.drawLine(p1, p2, paint);
     }
 
-    final connections = [
+    const bones = [
       [JointName.leftShoulder, JointName.rightShoulder],
       [JointName.leftShoulder, JointName.leftElbow],
       [JointName.leftElbow, JointName.leftWrist],
@@ -76,15 +80,20 @@ class _PosePainter extends CustomPainter {
       [JointName.rightKnee, JointName.rightAnkle],
     ];
 
-    for (final pair in connections) {
-      drawLine(pair[0], pair[1]);
+    for (final bone in bones) {
+      drawBone(bone[0], bone[1]);
     }
 
-    for (final kp in joints.values) {
-      canvas.drawCircle(Offset(kp.x * width, kp.y * height), 4, paint);
+    for (final entry in joints.entries) {
+      final kp = entry.value;
+      if (kp.confidence < 0.15) continue;
+      final pos = Offset(kp.x * size.width, kp.y * size.height);
+      final paint = Paint()..color = _confidenceColor(kp.confidence);
+      canvas.drawCircle(pos, kp.confidence >= 0.5 ? 5.0 : 3.5, paint);
     }
   }
 
   @override
-  bool shouldRepaint(CustomPainter oldDelegate) => true;
+  bool shouldRepaint(covariant _PosePainter old) =>
+      old.poseData != poseData;
 }

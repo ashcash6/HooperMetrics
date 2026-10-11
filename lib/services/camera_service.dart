@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:camera/camera.dart';
 import 'package:flutter/material.dart';
 
@@ -10,22 +12,21 @@ class CameraService {
   bool get isInitialized => _isInitialized;
 
   Future<void> initialize({CameraLensDirection preferredDirection = CameraLensDirection.back}) async {
-    debugPrint('[CameraService] Initializing camera...');
-    // Removed permission check here — handle permission externally
+    // Dispose any existing controller first so we never have two live sessions.
+    if (_controller != null) {
+      final old = _controller!;
+      _controller = null;
+      _isInitialized = false;
+      await old.dispose();
+    }
 
     final cameras = await availableCameras();
-    debugPrint('[CameraService] Available cameras count: ${cameras.length}');
-    if (cameras.isEmpty) {
-      debugPrint('[CameraService] No cameras found.');
-      _isInitialized = false;
-      return;
-    }
+    if (cameras.isEmpty) return;
 
     _camera = cameras.firstWhere(
       (cam) => cam.lensDirection == preferredDirection,
       orElse: () => cameras.first,
     );
-    debugPrint('[CameraService] Selected camera: ${_camera!.name}');
 
     _controller = CameraController(
       _camera!,
@@ -36,80 +37,82 @@ class CameraService {
     try {
       await _controller!.initialize();
       _isInitialized = true;
-      debugPrint('[CameraService] Camera initialized successfully.');
     } catch (e) {
-      debugPrint('[CameraService] Camera initialization failed: $e');
+      debugPrint('[CameraService] init failed: $e');
       _isInitialized = false;
     }
   }
 
   Future<void> startRecording() async {
-    if (!_isInitialized || _controller == null) {
-      debugPrint('[CameraService] Cannot start recording: Camera not initialized');
-      return;
-    }
-
+    if (!_isInitialized || _controller == null) return;
     try {
-      await _controller!.startVideoRecording();
-      debugPrint('[CameraService] Started video recording');
+      await _controller!.startVideoRecording()
+          .timeout(const Duration(seconds: 6));
+    } on TimeoutException {
+      debugPrint('[CameraService] startVideoRecording timed out — reinitializing');
+      await _recoverAndStart();
     } catch (e) {
-      debugPrint('[CameraService] Failed to start video recording: $e');
+      debugPrint('[CameraService] startRecording failed: $e — reinitializing');
+      await _recoverAndStart();
     }
+  }
+
+  // Dispose the session, rebuild it, and retry recording once.
+  Future<void> _recoverAndStart() async {
+    await initialize();
+    if (!_isInitialized || _controller == null) {
+      throw Exception('Camera session could not be recovered.');
+    }
+    await _controller!.startVideoRecording()
+        .timeout(const Duration(seconds: 6));
   }
 
   Future<void> stopRecording() async {
-    if (!_isInitialized || _controller == null) {
-      debugPrint('[CameraService] Cannot stop recording: Camera not initialized');
-      return;
-    }
-
+    if (!_isInitialized || _controller == null) return;
     try {
       final file = await _controller!.stopVideoRecording();
       recordedVideoPath = file.path;
-      debugPrint('[CameraService] Stopped video recording, saved to $recordedVideoPath');
     } catch (e) {
-      debugPrint('[CameraService] Failed to stop video recording: $e');
-    }
-  }
-
-  Future<void> startStreaming(Function(CameraImage) onImageAvailable) async {
-    if (!_isInitialized || _controller == null) {
-      debugPrint('[CameraService] Cannot start streaming: Camera not initialized');
-      return;
-    }
-
-    try {
-      await _controller!.startImageStream((CameraImage image) {
-        onImageAvailable(image);
-      });
-      debugPrint('[CameraService] Started image streaming');
-    } catch (e) {
-      debugPrint('[CameraService] Failed to start image streaming: $e');
-    }
-  }
-
-  Future<void> stopStreaming() async {
-    if (!_isInitialized || _controller == null) {
-      debugPrint('[CameraService] Cannot stop streaming: Camera not initialized');
-      return;
-    }
-
-    try {
-      await _controller!.stopImageStream();
-      debugPrint('[CameraService] Stopped image streaming');
-    } catch (e) {
-      debugPrint('[CameraService] Failed to stop image streaming: $e');
+      debugPrint('[CameraService] stopRecording failed: $e');
+      rethrow;
     }
   }
 
   Widget buildPreview() {
     if (!_isInitialized || _controller == null || !_controller!.value.isInitialized) {
-      return const Center(child: Text('Camera not available', style: TextStyle(color: Colors.white)));
+      return const Center(
+        child: Text('Camera not available', style: TextStyle(color: Colors.white)),
+      );
     }
-    return CameraPreview(_controller!);
+    // Scale preview to cover the available space without distortion.
+    // CameraPreview applies AspectRatio internally; with tight expand constraints
+    // that overrides the ratio and stretches the image. Transform.scale corrects
+    // for the mismatch between camera AR and screen AR (BoxFit.cover equivalent).
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final w = constraints.maxWidth;
+        final h = constraints.maxHeight;
+        if (w == 0 || h == 0 || !constraints.hasBoundedWidth || !constraints.hasBoundedHeight) {
+          return CameraPreview(_controller!);
+        }
+        final camAR = _controller!.value.aspectRatio;
+        if (camAR == 0) return CameraPreview(_controller!);
+        var scale = (w / h) * camAR;
+        if (scale < 1.0) scale = 1.0 / scale;
+        return ClipRect(
+          child: Transform.scale(
+            scale: scale,
+            child: Center(child: CameraPreview(_controller!)),
+          ),
+        );
+      },
+    );
   }
 
   void dispose() {
-    _controller?.dispose();
+    final c = _controller;
+    _controller = null;
+    _isInitialized = false;
+    c?.dispose();
   }
 }

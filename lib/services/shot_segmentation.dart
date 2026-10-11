@@ -1,116 +1,166 @@
-import 'dart:math';
+import 'package:flutter/foundation.dart';
 import '../models/pose_data.dart';
 import '../models/pose_keypoint.dart';
 
 class ShotSegmentation {
-  /// Returns absolute difference between two angles in degrees.
-  static double angleDifference(double a, double b) => (a - b).abs();
+  static double _angleDiff(double a, double b) => (a - b).abs();
 
-  /// Checks if the arm is in 'loaded' position based on right elbow angle (~90°).
-  static bool isArmLoaded(PoseData frame) {
-    final elbowAngle = frame.rightElbowAngle;
-    return elbowAngle >= 80 && elbowAngle <= 110;
+  /// Scans all frames to determine the dominant shooting hand.
+  static bool detectShootingHand(List<PoseData> frames) {
+    double bestRightClearance = 0;
+    double bestLeftClearance = 0;
+    const double minConf = 0.35;
+
+    for (final frame in frames) {
+      final rw = frame.joints[JointName.rightWrist];
+      final rs = frame.joints[JointName.rightShoulder];
+      final lw = frame.joints[JointName.leftWrist];
+      final ls = frame.joints[JointName.leftShoulder];
+
+      if (rw != null && rs != null &&
+          rw.confidence > minConf && rs.confidence > minConf) {
+        final clearance = rs.y - rw.y;
+        if (clearance > bestRightClearance) bestRightClearance = clearance;
+      }
+      if (lw != null && ls != null &&
+          lw.confidence > minConf && ls.confidence > minConf) {
+        final clearance = ls.y - lw.y;
+        if (clearance > bestLeftClearance) bestLeftClearance = clearance;
+      }
+    }
+
+    return bestRightClearance >= bestLeftClearance;
   }
 
-  /// Checks if the arm is extended (right elbow angle >= 150°).
-  static bool isArmExtended(PoseData frame) {
-    final elbowAngle = frame.rightElbowAngle;
-    return elbowAngle >= 150;
+  static bool _isArmLoaded(PoseData frame, bool rightHanded) {
+    final angle = rightHanded ? frame.rightElbowAngle : frame.leftElbowAngle;
+    return angle > 0 && angle >= 70 && angle <= 125;
   }
 
-  /// Returns true if wrist is above shoulder (y smaller means higher in image coordinates).
-  static bool isShoulderLifted(PoseData frame) {
-    final shoulder = frame.joints[JointName.rightShoulder]!;
-    final wrist = frame.joints[JointName.rightWrist]!;
+  static bool _isWristAboveShoulder(PoseData frame, bool rightHanded) {
+    final shoulderName =
+        rightHanded ? JointName.rightShoulder : JointName.leftShoulder;
+    final wristName =
+        rightHanded ? JointName.rightWrist : JointName.leftWrist;
+    final shoulder = frame.joints[shoulderName];
+    final wrist = frame.joints[wristName];
+    if (shoulder == null || wrist == null) return false;
     return wrist.y < shoulder.y;
   }
 
-  /// Checks if the right elbow angle is stable within a threshold over a window of frames.
-  static bool isArmStable(List<PoseData> frames, int start, int window, double angleThreshold) {
+  static bool _isValidShotStart(
+    List<PoseData> frames, int start, int window, bool rightHanded,
+  ) {
+    if (start + window > frames.length) return false;
     final angles = frames
         .sublist(start, start + window)
-        .map((f) => f.rightElbowAngle)
+        .map((f) => rightHanded ? f.rightElbowAngle : f.leftElbowAngle)
+        .where((a) => a > 0)
         .toList();
+    if (angles.length < (window / 2).ceil()) return false;
     final mean = angles.reduce((a, b) => a + b) / angles.length;
-    return angles.every((a) => angleDifference(a, mean) < angleThreshold);
+    return mean >= 70 && mean <= 125;
   }
 
-  /// Validates shot start by checking elbow angle stability around ~90° over a window.
-  static bool isValidShotStart(List<PoseData> frames, int start, int window) {
+  static bool _isValidShotEnd(
+    List<PoseData> frames, int start, int window, bool rightHanded,
+  ) {
     if (start + window > frames.length) return false;
-    final angles = frames.sublist(start, start + window).map((f) => f.rightElbowAngle).toList();
-    final meanAngle = angles.reduce((a, b) => a + b) / angles.length;
-    return meanAngle >= 80 && meanAngle <= 110;
+    final slice = frames.sublist(start, start + window);
+    final angles = slice
+        .map((f) => rightHanded ? f.rightElbowAngle : f.leftElbowAngle)
+        .where((a) => a > 0)
+        .toList();
+    if (angles.length < (window / 2).ceil()) return false;
+    final mean = angles.reduce((a, b) => a + b) / angles.length;
+    final wristAbove = slice.any((f) => _isWristAboveShoulder(f, rightHanded));
+    final stableCount = angles.where((a) => _angleDiff(a, mean) < 15.0).length;
+    final stable = stableCount >= (angles.length * 0.75).ceil();
+    return mean >= 130 && wristAbove && stable;
   }
 
-  /// Validates shot end: elbow angle ~150+, wrist above shoulder, angles stable.
-  static bool isValidShotEnd(List<PoseData> frames, int start, int window) {
-    if (start + window > frames.length) return false;
-    final angles = frames.sublist(start, start + window).map((f) => f.rightElbowAngle).toList();
-    final meanAngle = angles.reduce((a, b) => a + b) / angles.length;
-    final wristAboveShoulder = frames.sublist(start, start + window).every(
-        (f) => f.joints[JointName.rightWrist]!.y < f.joints[JointName.rightShoulder]!.y);
-    final stable = angles.every((a) => angleDifference(a, meanAngle) < 5.0);
-    return meanAngle >= 150 && wristAboveShoulder && stable;
+  /// Returns true if the person was not moving significantly in the frames
+  /// leading up to [start]. Walking causes large hip x-displacement in
+  /// normalized [0,1] coordinates; standing planted to shoot stays still.
+  static bool _isBodyPlanted(List<PoseData> frames, int start, int window) {
+    if (start < 2) return true;
+    final lookback = (start - window).clamp(0, frames.length - 1);
+    final xs = <double>[];
+    for (int i = lookback; i < start; i++) {
+      final lh = frames[i].joints[JointName.leftHip];
+      final rh = frames[i].joints[JointName.rightHip];
+      if (lh != null && rh != null &&
+          lh.confidence > 0.3 && rh.confidence > 0.3) {
+        xs.add((lh.x + rh.x) / 2.0);
+      }
+    }
+    if (xs.length < 2) return true; // not enough data, allow it
+    final maxX = xs.reduce((a, b) => a > b ? a : b);
+    final minX = xs.reduce((a, b) => a < b ? a : b);
+    // 5% of normalized frame width comfortably separates walking from standing.
+    return (maxX - minX) < 0.05;
   }
 
-  /// Detects shots based on pose data frames using angle thresholds and timing.
   static List<List<PoseData>> detectShots(
     List<PoseData> frames, {
-    int minShotDurationMs = 500,
-    int cooldownDurationMs = 400,
-    int holdFrames = 5,
-    double angleStabilityThreshold = 5.0,
-    int startEndValidationWindow = 5,
+    int minShotDurationMs = 400,
+    int cooldownDurationMs = 500,
+    int holdFrames = 4,
+    int validationWindow = 4,
   }) {
-    final List<List<PoseData>> shots = [];
+    final validFrames = frames.where((f) => f.isShootingArmVisible).toList();
+    if (validFrames.length < holdFrames * 3) return [];
+
+    final rightHanded = detectShootingHand(validFrames);
+    debugPrint('[ShotSegmentation] ${rightHanded ? "right" : "left"}-handed shooter.');
+
+    final shots = <List<PoseData>>[];
     bool inShot = false;
     int? shotStartIndex;
-    int cooldownEndTime = 0;
+    int cooldownEndMs = 0;
 
     int i = 0;
-    while (i < frames.length) {
-      final frame = frames[i];
+    while (i < validFrames.length) {
+      final frame = validFrames[i];
 
-      // Skip frames during cooldown period
-      if (frame.timestampMs < cooldownEndTime) {
+      if (frame.timestampMs < cooldownEndMs) {
         i++;
         continue;
       }
 
       if (!inShot) {
-        if (isArmLoaded(frame)) {
-          if (isValidShotStart(frames, i, startEndValidationWindow)) {
-            shotStartIndex = i;
-            inShot = true;
-          }
+        if (_isArmLoaded(frame, rightHanded) &&
+            _isValidShotStart(validFrames, i, validationWindow, rightHanded) &&
+            _isBodyPlanted(validFrames, i, validationWindow)) {
+          shotStartIndex = i;
+          inShot = true;
         }
       } else {
-        if (i + holdFrames >= frames.length) break;
+        if (i + holdFrames >= validFrames.length) break;
 
-        if (isValidShotEnd(frames, i, holdFrames)) {
+        if (_isValidShotEnd(validFrames, i, holdFrames, rightHanded)) {
           final end = i + holdFrames - 1;
-          final shotDuration = frames[end].timestampMs - frames[shotStartIndex!].timestampMs;
+          final duration = validFrames[end].timestampMs -
+              validFrames[shotStartIndex!].timestampMs;
 
-          if (shotDuration >= minShotDurationMs) {
-            shots.add(frames.sublist(shotStartIndex, end + 1));
-            cooldownEndTime = frames[end].timestampMs + cooldownDurationMs;
+          if (duration >= minShotDurationMs) {
+            shots.add(validFrames.sublist(shotStartIndex, end + 1));
+            cooldownEndMs = validFrames[end].timestampMs + cooldownDurationMs;
           }
 
           inShot = false;
           i = end + 1;
           continue;
         }
+
+        final angle = rightHanded ? frame.rightElbowAngle : frame.leftElbowAngle;
+        if (angle > 0 && angle < 50) inShot = false;
       }
 
       i++;
     }
 
-    // Remove first shot if likely junk (initial false positive)
-    if (shots.isNotEmpty) {
-      shots.removeAt(0);
-    }
-
+    debugPrint('[ShotSegmentation] Detected ${shots.length} shot(s).');
     return shots;
   }
 }
